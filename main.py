@@ -17,9 +17,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, AIORateLimiter, CommandHandler, MessageHandler, filters, ContextTypes
 
-from llama_index.core import VectorStoreIndex, Settings, PromptTemplate, SimpleDirectoryReader
+from llama_index.core import VectorStoreIndex, Settings, PromptTemplate, SimpleDirectoryReader, StorageContext
 from llama_index.core.response_synthesizers import ResponseMode
 from llama_index.core.retrievers import QueryFusionRetriever
 from llama_index.core.postprocessor import SentenceTransformerRerank
@@ -487,6 +487,13 @@ LINE_COMMENT     : '--' .*? '\r'? '\n' -> skip ;
 
 
 # ── Helper: LLM call with logging ───────────────────────────────
+
+
+async def llm_stream(prompt: str):
+    """Returns an async stream instead of a string."""
+    stream = await Settings.llm.astream_complete(prompt)
+    return stream
+
 
 def llm_call(prompt: str, step_name: str) -> str:
     """Call LLM with timing and logging."""
@@ -1083,11 +1090,12 @@ def build_engine() -> tuple[RetrieverQueryEngine, VectorStoreIndex] | None:
         logger.error("[INDEX] CONFLUENCE_BASE_URL not set")
         return None
 
+    PERSIST_DIR = "./storage"
     db = chromadb.PersistentClient(path="./chroma_db")
     collection = db.get_or_create_collection("my_docs")
     vector_store = ChromaVectorStore(chroma_collection=collection)
 
-    if collection.count() == 0:
+    if collection.count() == 0 or not os.path.exists(PERSIST_DIR):
         logger.info("[INDEX] Empty collection — loading from sources...")
 
         reader = ConfluenceReader(
@@ -1139,7 +1147,12 @@ def build_engine() -> tuple[RetrieverQueryEngine, VectorStoreIndex] | None:
 
         # Build index
         logger.info("[INDEX] Indexing %d pages + %d taxonomy nodes...", len(documents), len(taxonomy_nodes))
-        index = VectorStoreIndex.from_documents(documents, vector_store=vector_store)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        index = VectorStoreIndex.from_documents(
+            documents,
+            storage_context=storage_context,
+            store_nodes_override=True,  # force docstore population (ChromaVectorStore.stores_text=True skips it otherwise)
+        )
         index.insert_nodes(taxonomy_nodes)
 
         tax_count = sum(
@@ -1148,27 +1161,34 @@ def build_engine() -> tuple[RetrieverQueryEngine, VectorStoreIndex] | None:
         )
         logger.info("[INDEX] Taxonomy nodes in docstore: %d", tax_count)
 
-        has_docstore = True
+        # Persist docstore so warm restarts can rebuild BM25
+        index.storage_context.persist(persist_dir=PERSIST_DIR)
+        logger.info("[INDEX] Docstore persisted to %s", PERSIST_DIR)
     else:
         logger.info("[INDEX] Using existing index (%d chunks)", collection.count())
-        index = VectorStoreIndex.from_vector_store(vector_store)
-        has_docstore = False
+        # Load persisted docstore alongside ChromaDB vector store
+        storage_context = StorageContext.from_defaults(
+            vector_store=vector_store,
+            persist_dir=PERSIST_DIR,
+        )
+        index = VectorStoreIndex(
+            nodes=[],
+            storage_context=storage_context,
+            store_nodes_override=True,
+        )
 
-    # Build retriever
+    # Build retriever — always hybrid (docstore is always available now)
     vector_retriever = index.as_retriever(similarity_top_k=30)
 
-    if has_docstore:
-        all_nodes = list(index.docstore.docs.values())
-        bm25_retriever = BM25Retriever.from_defaults(nodes=all_nodes, similarity_top_k=30)
-        hybrid_retriever = QueryFusionRetriever(
-            retrievers=[vector_retriever, bm25_retriever],
-            num_queries=2,
-            similarity_top_k=30,
-        )
-        logger.info("[INDEX] Hybrid retriever (vector + BM25) ready")
-    else:
-        logger.warning("[INDEX] BM25 unavailable — using vector-only retrieval")
-        hybrid_retriever = vector_retriever
+    all_nodes = list(index.docstore.docs.values())
+    logger.info("[INDEX] Docstore has %d nodes for BM25", len(all_nodes))
+    bm25_retriever = BM25Retriever.from_defaults(nodes=all_nodes, similarity_top_k=30)
+    hybrid_retriever = QueryFusionRetriever(
+        retrievers=[vector_retriever, bm25_retriever],
+        num_queries=2,
+        similarity_top_k=30,
+    )
+    logger.info("[INDEX] Hybrid retriever (vector + BM25) ready")
 
     reranker = SentenceTransformerRerank(top_n=8, model=RANK_MODEL)
 
@@ -1178,6 +1198,14 @@ def build_engine() -> tuple[RetrieverQueryEngine, VectorStoreIndex] | None:
         response_mode=ResponseMode.COMPACT,
         text_qa_template=DOCS_QA_PROMPT,
     )
+
+    # List ALL collections
+    collections = db.list_collections()
+    for c in collections:
+        col = db.get_collection(c.name)
+        print(f"'{c.name}': {col.count()} docs")
+        data = col.get(limit=5, include=["documents", "embeddings"])
+        print(f"Docs in ChromaDB: {len(data['ids'])}")
 
     elapsed = time.time() - t0
     logger.info("[INDEX] Engine ready in %.1fs ✅", elapsed)
@@ -1315,6 +1343,7 @@ def main() -> None:
         .write_timeout(120)      # sending data to Telegram
         .connect_timeout(30)    # establishing connection
         .pool_timeout(30)       # waiting for a connection from the pool
+        .rate_limiter(AIORateLimiter())
         .build()
     )
 

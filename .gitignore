@@ -8,8 +8,9 @@ wheels/
 
 .env
 .venv/
-chroma_db/
 .DS_Store
 .vscode
 
 data/documents/
+storage/
+chroma_db/

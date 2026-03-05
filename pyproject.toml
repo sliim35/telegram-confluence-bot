@@ -14,5 +14,5 @@ dependencies = [
     "llama-index-retrievers-bm25>=0.6.5",
     "llama-index-vector-stores-chroma>=0.5.5",
     "python-dotenv>=1.2.1",
-    "python-telegram-bot>=22.6",
+    "python-telegram-bot[rate-limiter]>=22.6",
 ]
